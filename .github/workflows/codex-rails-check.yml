@@ -1,0 +1,247 @@
+name: codex-rails-check
+
+# Reusable org rails check, called by repositories across the organisation.
+# It runs on whatever runner the caller names, so it may only depend on tools
+# proven to exist on every runner image we operate. Ruby exists on the older
+# self-hosted image and not on the ARC image, so every parse step below runs on
+# python3 + PyYAML, asserted up front by the preflight.
+
+on:
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "**/AGENTS.md"
+      - ".agents/skills/**"
+      - ".github/scripts/**"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
+      - ".github/workflows/**"
+      - ".github/workflow-templates/**"
+      - "profile/**"
+      - "test/**"
+  workflow_call:
+    inputs:
+      require_agents:
+        description: "Fail when the repository does not have AGENTS.md"
+        required: false
+        type: boolean
+        default: false
+      runner_label:
+        description: "Runner label used for the validation job (owned private-CI ARC only)"
+        required: false
+        type: string
+        default: evalops-private-ci
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ${{ inputs.runner_label || 'evalops-private-ci' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Preflight the YAML toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is not on this runner (${RUNNER_NAME:-unknown}). codex-rails-check cannot parse YAML without it."
+            exit 1
+          fi
+          python3 -V
+
+          if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+            echo "::error::PyYAML is not importable on this runner (${RUNNER_NAME:-unknown}). Install python3-yaml on the runner image or add actions/setup-python + 'pip install pyyaml' before this workflow."
+            exit 1
+          fi
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+          cat > "${RUNNER_TEMP}/yamlcheck.py" <<'PY'
+          """Parse each argument as YAML. Exit 1 naming the first file that fails."""
+          import sys
+          import yaml
+
+          failed = False
+          for path in sys.argv[1:]:
+              try:
+                  with open(path, encoding="utf-8") as handle:
+                      yaml.safe_load(handle)
+              except (yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+                  detail = " ".join(str(exc).split())
+                  print(f"::error file={path}::{path} is not valid YAML: {detail}")
+                  failed = True
+              else:
+                  print(f"ok {path}")
+          sys.exit(1 if failed else 0)
+          PY
+
+          # Prove the validator still rejects bad input. Without this, a broken
+          # parser would let every later step pass while checking nothing.
+          selftest_dir="${RUNNER_TEMP}/yamlcheck-selftest"
+          mkdir -p "${selftest_dir}"
+          printf 'name: ok\nvalue: 1\n' > "${selftest_dir}/good.yml"
+          printf 'name: [unclosed\n  bad: : :\n' > "${selftest_dir}/bad.yml"
+
+          python3 "${RUNNER_TEMP}/yamlcheck.py" "${selftest_dir}/good.yml" >/dev/null
+          if python3 "${RUNNER_TEMP}/yamlcheck.py" "${selftest_dir}/bad.yml" >/dev/null 2>&1; then
+            echo "::error::YAML validator self-test failed: invalid YAML was accepted. This gate would have passed without checking anything."
+            exit 1
+          fi
+          echo "YAML validator self-test passed (accepts valid YAML, rejects invalid YAML)."
+
+      - name: Validate issue template YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          files=(.github/ISSUE_TEMPLATE/*.yml .github/ISSUE_TEMPLATE/*.yaml)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No issue template YAML files found."
+            exit 0
+          fi
+          python3 "${RUNNER_TEMP}/yamlcheck.py" "${files[@]}"
+
+      - name: Validate workflow YAML
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(.github/workflows/*.yml .github/workflows/*.yaml .github/workflow-templates/*.yml .github/workflow-templates/*.yaml)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No workflow YAML files found."
+            exit 0
+          fi
+          python3 "${RUNNER_TEMP}/yamlcheck.py" "${files[@]}"
+
+      - name: Validate workflow template metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(.github/workflow-templates/*.properties.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No workflow template metadata files found."
+            exit 0
+          fi
+          python3 - "${files[@]}" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          OCTICON = re.compile(r"\Aocticon [a-z0-9-]+\Z")
+
+          for path in sys.argv[1:]:
+              with open(path, encoding="utf-8") as handle:
+                  data = json.load(handle)
+              icon = str(data.get("iconName") or "")
+              if icon and not OCTICON.match(icon) and not os.path.exists(
+                  f".github/workflow-templates/{icon}.svg"
+              ):
+                  print(
+                      f'{path}: iconName must be an octicon reference like "octicon tag" '
+                      "or a local SVG basename",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              print(f"ok {path}")
+          PY
+
+      - name: Check AGENTS.md files
+        shell: bash
+        env:
+          REQUIRE_AGENTS: ${{ inputs.require_agents || false }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          if [ "${REQUIRE_AGENTS}" = "true" ] && [ ! -f AGENTS.md ]; then
+            echo "::error::AGENTS.md is required for this repository."
+            exit 1
+          fi
+
+          agents=(**/AGENTS.md)
+          if [ "${#agents[@]}" -eq 0 ]; then
+            echo "No AGENTS.md files found."
+            exit 0
+          fi
+
+          for agent in "${agents[@]}"; do
+            test -s "${agent}" || { echo "::error::${agent} is empty"; exit 1; }
+            echo "ok ${agent}"
+          done
+
+      - name: Validate skill frontmatter
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          skills=(.agents/skills/**/SKILL.md)
+          if [ "${#skills[@]}" -eq 0 ]; then
+            echo "No repo skills found."
+            exit 0
+          fi
+          python3 - "${skills[@]}" <<'PY'
+          import re
+          import sys
+
+          import yaml
+
+          NAME = re.compile(r"\A[a-z0-9][a-z0-9_-]*\Z")
+          SPLIT = re.compile(r"^---\s*$", re.MULTILINE)
+
+          failed = False
+          for path in sys.argv[1:]:
+              print(f"checking {path}")
+              with open(path, encoding="utf-8") as handle:
+                  text = handle.read()
+
+              if not text.startswith("---\n"):
+                  print(f"{path}: missing YAML frontmatter", file=sys.stderr)
+                  failed = True
+                  continue
+
+              parts = SPLIT.split(text, 2)
+              front = parts[1] if len(parts) > 1 else ""
+              try:
+                  data = yaml.safe_load(front)
+              except yaml.YAMLError as exc:
+                  detail = " ".join(str(exc).split())
+                  print(f"{path}: frontmatter is not valid YAML: {detail}", file=sys.stderr)
+                  failed = True
+                  continue
+
+              if not isinstance(data, dict) or not NAME.match(str(data.get("name") or "")):
+                  print(f"{path}: frontmatter must include kebab/snake-safe name", file=sys.stderr)
+                  failed = True
+                  continue
+
+              if len(str(data.get("description") or "").strip()) < 20:
+                  print(f"{path}: frontmatter must include a useful description", file=sys.stderr)
+                  failed = True
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Run repo Ruby tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          tests=(test/**/*_test.rb test/*_test.rb)
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "No Ruby tests found."
+            exit 0
+          fi
+
+          # Reached only by repos that actually ship a Ruby suite. Fail loudly
+          # rather than skipping: a silently skipped test suite is worse than a
+          # red check, and the ARC image has no Ruby interpreter.
+          if ! command -v ruby >/dev/null 2>&1; then
+            echo "::error::This repository has ${#tests[@]} Ruby test file(s) but the runner (${RUNNER_NAME:-unknown}) has no ruby. Add ruby/setup-ruby to the calling workflow or run this job on a runner image that ships Ruby."
+            exit 1
+          fi
+
+          ruby -Itest "${tests[@]}"

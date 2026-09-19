@@ -1,0 +1,43 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "1111111111111111111111111111111111111111",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": []
+        },
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": []
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": [
+            {
+              "id": "RT_blocking",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "src/lib.rs",
+              "line": 42,
+              "comments": {
+                "nodes": [
+                  {
+                    "body": "High Severity: unchecked index can panic.",
+                    "url": "https://example.invalid/t/3"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

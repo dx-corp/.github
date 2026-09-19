@@ -1,0 +1,78 @@
+{
+  "data": {
+    "repository": {
+      "pullRequest": {
+        "headRefOid": "0000000000000000000000000000000000000000",
+        "comments": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "coderabbitai"
+              },
+              "body": "## PR Summary\n\nEverything looks fine.",
+              "url": "https://example.invalid/c/1"
+            }
+          ]
+        },
+        "reviews": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": [
+            {
+              "author": {
+                "login": "reviewer"
+              },
+              "body": "Low Severity: naming nit.",
+              "commit": {
+                "oid": "0000000000000000000000000000000000000000"
+              },
+              "state": "COMMENTED",
+              "url": "https://example.invalid/r/1"
+            }
+          ]
+        },
+        "reviewThreads": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": [
+            {
+              "id": "RT_clean_resolved",
+              "isResolved": true,
+              "isOutdated": false,
+              "path": "src/lib.rs",
+              "line": 10,
+              "comments": {
+                "nodes": [
+                  {
+                    "body": "High Severity: fixed and resolved.",
+                    "url": "https://example.invalid/t/1"
+                  }
+                ]
+              }
+            },
+            {
+              "id": "RT_clean_low",
+              "isResolved": false,
+              "isOutdated": false,
+              "path": "src/lib.rs",
+              "line": 22,
+              "comments": {
+                "nodes": [
+                  {
+                    "body": "Low Severity: optional cleanup.",
+                    "url": "https://example.invalid/t/2"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

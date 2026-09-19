@@ -1,0 +1,152 @@
+name: review-thread-guard
+
+# Produces the `unresolved-review-threads` check, which callers wire up as a
+# required status check on protected branches. It runs on the caller's runner,
+# so it may only depend on tools present on every runner image we operate. The
+# guard used to shell out to Ruby; the ARC image ships no Ruby, so it now runs
+# on python3 (standard library only) with an explicit preflight and a fixture
+# self-test that proves the gate can still fail.
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to inspect"
+        required: true
+        type: string
+      min_severity:
+        description: "Minimum severity to block on"
+        required: false
+        default: "high"
+        type: string
+      runner_label:
+        description: "Runner label used for the validation job (owned private-CI ARC only)"
+        required: false
+        type: string
+        default: evalops-private-ci
+      guard_ref:
+        description: "evalops/.github ref to checkout for guard scripts"
+        required: false
+        type: string
+      settle_seconds:
+        description: "Seconds to wait before checking review feedback so bot reviews can finish before auto-merge"
+        required: false
+        type: string
+        default: "90"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository to inspect, as owner/name"
+        required: false
+        type: string
+      pr_number:
+        description: "Pull request number to inspect"
+        required: true
+        type: string
+      min_severity:
+        description: "Minimum severity to block on"
+        required: false
+        default: "high"
+        type: choice
+        options:
+          - high
+          - p1
+          - p0
+      guard_ref:
+        description: "evalops/.github ref to checkout for guard scripts"
+        required: false
+        type: string
+      settle_seconds:
+        description: "Seconds to wait before checking review feedback so bot reviews can finish before auto-merge"
+        required: false
+        type: string
+        default: "90"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  unresolved-review-threads:
+    runs-on: ${{ inputs.runner_label || 'evalops-private-ci' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: evalops/.github
+          ref: ${{ inputs.guard_ref || github.workflow_sha }}
+          path: evalops-github
+
+      - name: Preflight the guard toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is not on this runner (${RUNNER_NAME:-unknown}). The review-thread guard cannot run, and it must not be skipped."
+            exit 1
+          fi
+          python3 -V
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh is not on this runner (${RUNNER_NAME:-unknown}). The guard reads review threads over the GitHub GraphQL API and cannot verify anything without it."
+            exit 1
+          fi
+          gh --version | head -1
+
+          test -f evalops-github/.github/scripts/check_pr_review_threads.py
+
+      - name: Prove the guard can still fail
+        shell: bash
+        run: |
+          set -euo pipefail
+          guard=evalops-github/.github/scripts/check_pr_review_threads.py
+          fixtures=evalops-github/.github/scripts/fixtures
+          log="${RUNNER_TEMP}/guard-selftest.log"
+
+          # A clean PR must pass. Output is captured so the fixtures never emit
+          # ::error:: annotations against the real PR under review.
+          if ! python3 "${guard}" --json "${fixtures}/review-threads-clean.json" --min-severity high >"${log}" 2>&1; then
+            echo "::error::review-thread guard self-test failed: the clean fixture was reported as blocking."
+            sed 's/^::/ /' "${log}"
+            exit 1
+          fi
+
+          # A PR with an unresolved high-severity thread must fail. If this ever
+          # passes, the guard has stopped verifying and every PR would merge
+          # with a green check.
+          if python3 "${guard}" --json "${fixtures}/review-threads-blocking.json" --min-severity high >"${log}" 2>&1; then
+            echo "::error::review-thread guard self-test failed: a blocking fixture was reported clean. This gate is not verifying anything."
+            sed 's/^::/ /' "${log}"
+            exit 1
+          fi
+
+          echo "Guard self-test passed: clean fixture exits 0, blocking fixture exits non-zero."
+
+      - name: Let asynchronous review bots settle
+        env:
+          SETTLE_SECONDS: ${{ inputs.settle_seconds || '90' }}
+        run: |
+          set -euo pipefail
+          case "${SETTLE_SECONDS}" in
+            ''|*[!0-9]*)
+              echo "::error::settle_seconds must be a non-negative integer"
+              exit 2
+              ;;
+          esac
+          if [ "${SETTLE_SECONDS}" -gt 0 ]; then
+            echo "Waiting ${SETTLE_SECONDS}s before checking review feedback."
+            sleep "${SETTLE_SECONDS}"
+          fi
+
+      - name: Fail on unresolved high-priority review threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ inputs.repo || github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MIN_SEVERITY: ${{ inputs.min_severity || 'high' }}
+        run: |
+          python3 evalops-github/.github/scripts/check_pr_review_threads.py \
+            --repo "${TARGET_REPO}" \
+            --pr "${PR_NUMBER}" \
+            --min-severity "${MIN_SEVERITY}"

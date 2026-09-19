@@ -1,0 +1,336 @@
+name: agent-authorship-label
+
+# Reusable org authorship labeler, called by repositories across the
+# organisation. It runs on whatever runner the caller names, so it may only
+# depend on tools proven to exist on every runner image we operate. Ruby is
+# absent from newer images (fleet-wide `ruby: command not found`, see
+# evalops/platform#5205), so the classifier runs on python3, asserted up
+# front by the preflight.
+
+on:
+  workflow_call:
+    inputs:
+      fail_on_incomplete:
+        description: "Fail when a Maestro-marked commit is missing one or more required Maestro trailers"
+        required: false
+        type: boolean
+        default: false
+      runner_label:
+        description: "Runner label used for the label job (owned private-CI ARC only)"
+        required: false
+        type: string
+        default: evalops-private-ci
+      helper_ref:
+        description: "evalops/.github ref used to checkout helper scripts"
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  label:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout org workflow helpers
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: evalops/.github
+          ref: ${{ inputs.helper_ref }}
+          path: org-defaults
+
+      - name: Preflight the classification toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is not on this runner (${RUNNER_NAME:-unknown}). agent-authorship-label cannot classify commits without it."
+            exit 1
+          fi
+          python3 -V
+
+      - name: Resolve pull request
+        id: pr
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          number="$(jq -r '.pull_request.number // empty' "${GITHUB_EVENT_PATH}")"
+          if [ -z "${number}" ]; then
+            echo "::error::agent-authorship-label must run from a pull_request or pull_request_target event."
+            exit 1
+          fi
+
+          echo "number=${number}" >> "${GITHUB_OUTPUT}"
+
+      - name: Fetch pull request commits
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[] | {sha: .sha, message: .commit.message}' > commits.jsonl
+
+      - name: Classify authorship
+        id: classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 org-defaults/.github/scripts/classify_agent_authorship.py \
+            --github-output "${GITHUB_OUTPUT}" \
+            commits.jsonl
+
+      - name: Ensure authorship labels exist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          label_api_denied() {
+            local output_file="$1"
+            grep -qiE '(Bad credentials|HTTP 401|Resource not accessible|HTTP 403)' "${output_file}"
+          }
+
+          warn_label_api_denied() {
+            local action="$1"
+            local output_file="$2"
+            echo "::warning::Skipping authorship label maintenance while ${action}; GitHub API denied label access."
+            cat "${output_file}" >&2
+          }
+
+          ensure_label() {
+            local name="$1"
+            local color="$2"
+            local description="$3"
+            local label_json
+            local lookup_stderr
+            local lookup_status=0
+            lookup_stderr="$(mktemp)"
+            label_json="$(gh api "repos/${GITHUB_REPOSITORY}/labels/${name}" 2>"${lookup_stderr}")" || lookup_status=$?
+
+            if [ "${lookup_status}" -eq 0 ]; then
+              rm -f "${lookup_stderr}"
+              local existing_color
+              local existing_description
+              existing_color="$(jq -r '.color // ""' <<<"${label_json}")"
+              existing_description="$(jq -r '.description // ""' <<<"${label_json}")"
+
+              if [ "${existing_color}" != "${color}" ] || [ "${existing_description}" != "${description}" ]; then
+                local update_stderr
+                local update_status=0
+                update_stderr="$(mktemp)"
+                gh api --method PATCH "repos/${GITHUB_REPOSITORY}/labels/${name}" \
+                  -f color="${color}" \
+                  -f description="${description}" >/dev/null 2>"${update_stderr}" || update_status=$?
+                if [ "${update_status}" -ne 0 ]; then
+                  if label_api_denied "${update_stderr}"; then
+                    warn_label_api_denied "updating ${name}" "${update_stderr}"
+                    rm -f "${update_stderr}"
+                    return 0
+                  fi
+                  cat "${update_stderr}" >&2
+                  rm -f "${update_stderr}"
+                  return "${update_status}"
+                fi
+                rm -f "${update_stderr}"
+              fi
+              return 0
+            fi
+
+            if label_api_denied "${lookup_stderr}"; then
+              warn_label_api_denied "looking up ${name}" "${lookup_stderr}"
+              rm -f "${lookup_stderr}"
+              return 0
+            fi
+
+            if ! grep -qiE '(not found|404)' "${lookup_stderr}" && ! jq -e '(.status | tostring) == "404" or .message == "Not Found"' <<<"${label_json}" >/dev/null 2>&1; then
+              cat "${lookup_stderr}" >&2
+              if [ -n "${label_json}" ]; then
+                printf '%s\n' "${label_json}" >&2
+              fi
+              rm -f "${lookup_stderr}"
+              return "${lookup_status}"
+            fi
+            rm -f "${lookup_stderr}"
+
+            local output_file
+            local create_status=0
+            output_file="$(mktemp)"
+
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/labels" \
+              -f name="${name}" \
+              -f color="${color}" \
+              -f description="${description}" >"${output_file}" 2>&1 || create_status=$?
+
+            if [ "${create_status}" -eq 0 ]; then
+              rm -f "${output_file}"
+              return 0
+            fi
+
+            if grep -qiE '(already.?exists|already_exists|Validation Failed)' "${output_file}"; then
+              echo "Label ${name} was created concurrently; updating metadata if needed."
+              rm -f "${output_file}"
+              create_status=0
+              output_file="$(mktemp)"
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/labels/${name}" \
+                -f color="${color}" \
+                -f description="${description}" >"${output_file}" 2>&1 || create_status=$?
+              if [ "${create_status}" -ne 0 ]; then
+                if label_api_denied "${output_file}"; then
+                  warn_label_api_denied "updating concurrently-created ${name}" "${output_file}"
+                  rm -f "${output_file}"
+                  return 0
+                fi
+                cat "${output_file}" >&2
+                rm -f "${output_file}"
+                return "${create_status}"
+              fi
+              rm -f "${output_file}"
+              return 0
+            fi
+
+            if label_api_denied "${output_file}"; then
+              warn_label_api_denied "creating ${name}" "${output_file}"
+              rm -f "${output_file}"
+              return 0
+            fi
+
+            cat "${output_file}" >&2
+            rm -f "${output_file}"
+            return "${create_status}"
+          }
+
+          ensure_label "agent-authored" "6f42c1" "All PR commits carry explicit Maestro authorship trailers"
+          ensure_label "agent-assisted" "1d76db" "PR commits are assumed LLM-assisted but do not carry explicit Maestro trailers"
+          ensure_label "mixed-authorship" "fbca04" "Some PR commits carry explicit Maestro trailers and some are untrailered"
+
+      - name: Apply authorship label
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          AUTHORSHIP_LABEL: ${{ steps.classify.outputs.label }}
+        run: |
+          set -euo pipefail
+
+          label_api_denied() {
+            local output_file="$1"
+            grep -qiE '(Bad credentials|HTTP 401|Resource not accessible|HTTP 403)' "${output_file}"
+          }
+
+          skip_label_apply() {
+            local action="$1"
+            local output_file="$2"
+            echo "::warning::Skipping authorship label apply while ${action}; GitHub API denied label access."
+            cat "${output_file}" >&2
+            exit 0
+          }
+
+          current_labels_file="$(mktemp)"
+          current_labels_stderr="$(mktemp)"
+          current_labels_status=0
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" \
+            --jq '.[].name' >"${current_labels_file}" 2>"${current_labels_stderr}" || current_labels_status=$?
+          if [ "${current_labels_status}" -ne 0 ]; then
+            if label_api_denied "${current_labels_stderr}"; then
+              skip_label_apply "listing labels on #${PR_NUMBER}" "${current_labels_stderr}"
+            fi
+            cat "${current_labels_stderr}" >&2
+            rm -f "${current_labels_file}" "${current_labels_stderr}"
+            exit "${current_labels_status}"
+          fi
+          current_labels="$(cat "${current_labels_file}")"
+          rm -f "${current_labels_file}" "${current_labels_stderr}"
+
+          has_label() {
+            local label="$1"
+            grep -Fxq "${label}" <<<"${current_labels}"
+          }
+
+          authorship_labels=(agent-authored agent-assisted mixed-authorship human-authored)
+          conflicting_labels=()
+          has_desired_label=false
+
+          for label in "${authorship_labels[@]}"; do
+            if ! has_label "${label}"; then
+              continue
+            fi
+            if [ "${label}" = "${AUTHORSHIP_LABEL}" ]; then
+              has_desired_label=true
+            else
+              conflicting_labels+=("${label}")
+            fi
+          done
+
+          if [ "${has_desired_label}" = true ] && [ "${#conflicting_labels[@]}" -eq 0 ]; then
+            echo "Authorship label ${AUTHORSHIP_LABEL} is already current on #${PR_NUMBER}; no label changes needed."
+            exit 0
+          fi
+
+          delete_label_if_present() {
+            local label="$1"
+            local stderr_file
+            local status=0
+            stderr_file="$(mktemp)"
+
+            gh api --method DELETE \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels/${label}" >/dev/null 2>"${stderr_file}" || status=$?
+
+            if [ "${status}" -eq 0 ]; then
+              rm -f "${stderr_file}"
+              return 0
+            fi
+
+            if grep -qiE '(not found|404)' "${stderr_file}"; then
+              echo "Label ${label} was already absent; continuing."
+              rm -f "${stderr_file}"
+              return 0
+            fi
+
+            if label_api_denied "${stderr_file}"; then
+              skip_label_apply "removing ${label} from #${PR_NUMBER}" "${stderr_file}"
+            fi
+
+            cat "${stderr_file}" >&2
+            rm -f "${stderr_file}"
+            return "${status}"
+          }
+
+          for label in "${conflicting_labels[@]}"; do
+            delete_label_if_present "${label}"
+          done
+
+          if [ "${has_desired_label}" != true ]; then
+            add_stderr="$(mktemp)"
+            add_status=0
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" \
+              -f "labels[]=${AUTHORSHIP_LABEL}" >/dev/null 2>"${add_stderr}" || add_status=$?
+            if [ "${add_status}" -ne 0 ]; then
+              if label_api_denied "${add_stderr}"; then
+                skip_label_apply "adding ${AUTHORSHIP_LABEL} to #${PR_NUMBER}" "${add_stderr}"
+              fi
+              cat "${add_stderr}" >&2
+              rm -f "${add_stderr}"
+              exit "${add_status}"
+            fi
+            rm -f "${add_stderr}"
+          fi
+
+          echo "Applied ${AUTHORSHIP_LABEL} to #${PR_NUMBER}."
+
+      - name: Check required Maestro trailers
+        if: ${{ inputs.fail_on_incomplete && steps.classify.outputs.incomplete_agent_commits != '0' }}
+        shell: bash
+        env:
+          INCOMPLETE_AGENT_COMMITS: ${{ steps.classify.outputs.incomplete_agent_commits }}
+        run: |
+          echo "::error::${INCOMPLETE_AGENT_COMMITS} Maestro-marked commit(s) are missing required authorship trailers."
+          exit 1
