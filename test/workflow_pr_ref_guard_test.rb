@@ -1,9 +1,63 @@
 # frozen_string_literal: true
 
 require "minitest/autorun"
+require "fileutils"
+require "open3"
+require "tmpdir"
 require "yaml"
 
 class WorkflowPrRefGuardTest < Minitest::Test
+  def test_codex_rails_validates_a_fresh_checkout_when_the_runner_store_is_corrupt
+    workflow = YAML.safe_load(
+      File.read(File.join(root, ".github", "workflows", "codex-rails-check.yml")),
+      aliases: true,
+    )
+    job = workflow.fetch("jobs").fetch("validate")
+    checkout = job.fetch("steps").find { |step| step["uses"].to_s.start_with?("actions/checkout@") }
+    template = checkout.fetch("with").fetch("path")
+    assert_includes template, "${{ github.run_id }}"
+    assert_includes template, "${{ github.run_attempt }}"
+    assert_equal template, job.fetch("defaults").fetch("run").fetch("working-directory")
+    job.fetch("steps").select { |step| step.key?("run") }.each do |step|
+      assert_equal template, step.fetch("working-directory", template)
+    end
+
+    Dir.mktmpdir("codex-rails-checkout-test") do |temp|
+      source = File.join(temp, "source")
+      reused = File.join(temp, "runner", "mono")
+      FileUtils.mkdir_p(File.join(source, ".github", "workflows"))
+      File.write(File.join(source, ".github", "workflows", "fixture.yml"), "name: fixture\n")
+      git!("init", source)
+      git!("-C", source, "add", ".")
+      git!("-C", source, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture")
+      git!("clone", "--no-hardlinks", source, reused)
+      blob = git!("-C", reused, "rev-parse", "HEAD:.github/workflows/fixture.yml").strip
+      File.delete(File.join(reused, ".git", "objects", blob[0, 2], blob[2..-1]))
+      _, _, broken = Open3.capture3("git", "-C", reused, "fsck", "--full")
+      refute broken.success?, "The disposable reused checkout must actually lack a Git object."
+      sentinel = File.join(temp, "runner", "cache-sentinel")
+      File.write(sentinel, "preserve me")
+
+      relative = template.gsub("${{ github.run_id }}", "123").gsub("${{ github.run_attempt }}", "2")
+      fresh = File.join(temp, "runner", relative)
+      git!("clone", "--no-local", source, fresh)
+      git!("-C", fresh, "fsck", "--full")
+      git!("-C", fresh, "cat-file", "-e", "#{blob}^{blob}")
+      env = { "RUNNER_TEMP" => temp, "RUNNER_NAME" => "fixture" }
+      preflight = job.fetch("steps").find { |step| step["name"] == "Preflight the YAML toolchain" }.fetch("run")
+      validate = job.fetch("steps").find { |step| step["name"] == "Validate workflow YAML" }.fetch("run")
+      [preflight, validate].each do |script|
+        stdout, stderr, status = Open3.capture3(env, "bash", "-c", script, chdir: fresh)
+        assert status.success?, "Fresh-checkout validation failed: #{stdout}\n#{stderr}"
+      end
+      File.write(File.join(fresh, ".github", "workflows", "fixture.yml"), "name: [unclosed\n")
+      _, _, invalid = Open3.capture3(env, "bash", "-c", validate, chdir: fresh)
+      refute invalid.success?, "The unchanged validator must still reject invalid workflow YAML."
+      assert_equal "preserve me", File.read(sentinel)
+      assert File.directory?(File.join(reused, ".git")), "The reused runner store must not be deleted."
+    end
+  end
+
   def test_review_workflows_do_not_depend_on_synthetic_pull_request_merge_refs
     offenders = []
     workflow_paths.each do |path|
@@ -89,6 +143,12 @@ class WorkflowPrRefGuardTest < Minitest::Test
   end
 
   private
+
+  def git!(*args)
+    stdout, stderr, status = Open3.capture3("git", *args)
+    assert status.success?, "git #{args.join(' ')} failed: #{stderr}"
+    stdout
+  end
 
   def root
     File.expand_path("..", __dir__)
