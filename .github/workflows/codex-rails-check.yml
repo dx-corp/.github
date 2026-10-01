@@ -39,8 +39,15 @@ jobs:
   validate:
     runs-on: ${{ inputs.runner_label || 'evalops-private-ci' }}
     timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: codex-rails-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          # Persistent runners can retain an incomplete Git object store.
+          # Each attempt validates a fresh checkout without deleting that store.
+          path: codex-rails-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Preflight the YAML toolchain
         shell: bash
